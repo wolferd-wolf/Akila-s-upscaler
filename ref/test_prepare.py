@@ -5,9 +5,14 @@ from prepare import (
     pixel_uv_grid,
     reproject_uv,
     sample_bilinear,
-    disocclusion_validity,
+    normalized_to_view_space_depth,
+    depth_clip_factor,
     prepare_pass,
+    FSR2_KSEP,
 )
+
+
+FOV_60 = np.radians(60.0)
 
 
 def test_pixel_uv_grid_shape_and_range():
@@ -20,9 +25,7 @@ def test_pixel_uv_grid_shape_and_range():
 def test_pixel_uv_grid_corners():
     h, w = 2, 2
     grid = pixel_uv_grid(h, w)
-    # top-left pixel center
     assert np.allclose(grid[0, 0], [0.25, 0.25])
-    # bottom-right pixel center
     assert np.allclose(grid[1, 1], [0.75, 0.75])
 
 
@@ -40,8 +43,6 @@ def test_reproject_uv_shape_mismatch_raises():
 
 
 def test_reproject_uv_known_shift():
-    # current pixel moved +0.1 in u since previous frame means
-    # mv = uv_current - uv_previous = 0.1, so prev_uv = current - 0.1
     h, w = 4, 4
     mv = np.zeros((h, w, 2))
     mv[..., 0] = 0.1
@@ -59,11 +60,9 @@ def test_sample_bilinear_constant_buffer_returns_constant():
 
 
 def test_sample_bilinear_gradient_interpolates():
-    # buffer where value == column index; sampling mid-pixel should
-    # interpolate smoothly, not just nearest-neighbor snap.
     w = 10
     buf = np.tile(np.arange(w, dtype=np.float64), (10, 1))
-    uv = np.array([[0.55, 0.5]])  # roughly column 5.5 before clamping logic
+    uv = np.array([[0.55, 0.5]])
     result = sample_bilinear(buf, uv)
     assert 4.0 <= result[0] <= 6.0
 
@@ -71,48 +70,100 @@ def test_sample_bilinear_gradient_interpolates():
 def test_sample_bilinear_out_of_range_clamps_to_edge():
     buf = np.zeros((4, 4))
     buf[0, 0] = 9.0
-    uv = np.array([[-0.5, -0.5]])  # far outside [0,1], should clamp to corner
+    uv = np.array([[-0.5, -0.5]])
     result = sample_bilinear(buf, uv)
     assert np.isclose(result[0], 9.0)
 
 
-def test_disocclusion_validity_static_scene_all_valid():
-    h, w = 8, 8
-    depth = np.random.default_rng(0).uniform(0.1, 1.0, size=(h, w))
-    mv = np.zeros((h, w, 2))
-    prev_uv = reproject_uv(mv, h, w)
-    validity = disocclusion_validity(depth, depth, prev_uv)
-    assert validity.all()
+def test_view_space_depth_near_and_far_bounds():
+    near, far = 0.1, 1000.0
+    z_near = normalized_to_view_space_depth(np.array([0.0]), near, far)
+    z_far = normalized_to_view_space_depth(np.array([1.0]), near, far)
+    assert np.isclose(z_near[0], near)
+    assert np.isclose(z_far[0], far)
 
 
-def test_disocclusion_validity_rejects_off_screen_reprojection():
+def test_view_space_depth_monotonic():
+    near, far = 0.1, 1000.0
+    d = np.linspace(0.0, 1.0, 20)
+    z = normalized_to_view_space_depth(d, near, far)
+    assert np.all(np.diff(z) > 0)
+
+
+def test_depth_clip_factor_static_scene_not_rejected():
+    # depth_clip_factor: 1.0 = reject, 0.0 = trust (matches AMD naming).
     h, w = 8, 8
     depth = np.full((h, w), 0.5)
     mv = np.zeros((h, w, 2))
-    mv[..., 0] = -2.0  # pushes prev_uv way outside [0,1]
     prev_uv = reproject_uv(mv, h, w)
-    validity = disocclusion_validity(depth, depth, prev_uv)
-    assert not validity.any()
+    reject = depth_clip_factor(
+        depth, depth, prev_uv, near=0.1, far=1000.0, fov_y_radians=FOV_60
+    )
+    assert np.all(reject < 0.01)
 
 
-def test_disocclusion_validity_rejects_depth_mismatch():
+def test_depth_clip_factor_rejects_off_screen_reprojection():
     h, w = 8, 8
-    current_depth = np.full((h, w), 0.5)
-    history_depth = np.full((h, w), 0.9)  # large mismatch -> disoccluded
+    depth = np.full((h, w), 0.5)
+    mv = np.zeros((h, w, 2))
+    mv[..., 0] = -2.0
+    prev_uv = reproject_uv(mv, h, w)
+    reject = depth_clip_factor(
+        depth, depth, prev_uv, near=0.1, far=1000.0, fov_y_radians=FOV_60
+    )
+    assert np.all(reject == 1.0)
+
+
+def test_depth_clip_factor_large_depth_jump_rejected():
+    # Disocclusion = currently-visible surface is FARTHER than what
+    # history held here (a nearer occluder from last frame is gone,
+    # revealing background history never saw at this pixel).
+    # depth_clip_factor should be HIGH (near 1) -- reject this history.
+    h, w = 8, 8
+    current_depth = np.full((h, w), 0.95)  # far now
+    history_depth = np.full((h, w), 0.05)  # was near
     mv = np.zeros((h, w, 2))
     prev_uv = reproject_uv(mv, h, w)
-    validity = disocclusion_validity(current_depth, history_depth, prev_uv)
-    assert not validity.any()
+    reject = depth_clip_factor(
+        current_depth, history_depth, prev_uv,
+        near=0.1, far=1000.0, fov_y_radians=FOV_60,
+    )
+    assert np.all(reject > 0.5)
 
 
-def test_disocclusion_validity_accepts_small_depth_noise():
+def test_depth_clip_factor_tiny_depth_noise_not_rejected():
     h, w = 8, 8
     current_depth = np.full((h, w), 0.5)
-    history_depth = np.full((h, w), 0.505)  # 1% diff, within default 2% threshold
+    history_depth = current_depth + 1e-6
     mv = np.zeros((h, w, 2))
     prev_uv = reproject_uv(mv, h, w)
-    validity = disocclusion_validity(current_depth, history_depth, prev_uv)
-    assert validity.all()
+    reject = depth_clip_factor(
+        current_depth, history_depth, prev_uv,
+        near=0.1, far=1000.0, fov_y_radians=FOV_60,
+    )
+    assert np.all(reject < 0.1)
+
+
+def test_depth_clip_factor_new_closer_geometry_not_penalized_by_this_term():
+    # Current surface CLOSER than history (something moved toward camera,
+    # or new geometry appeared in front) -- depth_diff <= 0, not penalized
+    # by this depth-clip term specifically. Other terms (motion divergence)
+    # are responsible for catching this case; not this function's job.
+    # depth_clip_factor should stay LOW (trust) here.
+    h, w = 8, 8
+    current_depth = np.full((h, w), 0.1)  # near now
+    history_depth = np.full((h, w), 0.9)  # was far
+    mv = np.zeros((h, w, 2))
+    prev_uv = reproject_uv(mv, h, w)
+    reject = depth_clip_factor(
+        current_depth, history_depth, prev_uv,
+        near=0.1, far=1000.0, fov_y_radians=FOV_60,
+    )
+    assert np.all(reject < 0.01)
+
+
+def test_ksep_constant_matches_fsr2_source():
+    assert FSR2_KSEP == 1.37e-05
 
 
 def test_prepare_pass_end_to_end_static_scene():
@@ -120,19 +171,21 @@ def test_prepare_pass_end_to_end_static_scene():
     rng = np.random.default_rng(1)
     depth = rng.uniform(0.1, 1.0, size=(h, w))
     mv = np.zeros((h, w, 2))
-    prev_uv, validity = prepare_pass(depth, depth, mv)
+    prev_uv, confidence = prepare_pass(depth, depth, mv)
     assert prev_uv.shape == (h, w, 2)
-    assert validity.shape == (h, w)
-    assert validity.all()
+    assert confidence.shape == (h, w)
+    assert np.all(confidence > 0.9)
 
 
 def test_prepare_pass_mixed_occlusion():
     h, w = 8, 8
-    current_depth = np.full((h, w), 0.5)
-    history_depth = np.full((h, w), 0.5)
-    # simulate an object that appeared this frame: right half occluded
-    history_depth[:, w // 2:] = 0.9
+    current_depth = np.full((h, w), 0.05)
+    history_depth = np.full((h, w), 0.05)
+    # right half: something that was close (history) is gone, revealing
+    # a much farther surface now -- history there is stale, should reject.
+    current_depth[:, w // 2:] = 0.9
+    history_depth[:, w // 2:] = 0.02
     mv = np.zeros((h, w, 2))
-    prev_uv, validity = prepare_pass(current_depth, history_depth, mv)
-    assert validity[:, : w // 2].all()
-    assert not validity[:, w // 2:].any()
+    prev_uv, confidence = prepare_pass(current_depth, history_depth, mv)
+    assert np.all(confidence[:, : w // 2] > 0.9)
+    assert np.all(confidence[:, w // 2:] < 0.5)

@@ -70,26 +70,43 @@ def sample_bilinear(buffer: np.ndarray, uv: np.ndarray) -> np.ndarray:
     return top * (1 - fy) + bottom * fy
 
 
-def disocclusion_validity(
+FSR2_KSEP = 1.37e-05  # empirically tuned constant, ported from AMD's source
+
+
+def normalized_to_view_space_depth(normalized_depth, near, far):
+    """Reconstruct linear view-space depth from normalized [0,1] depth."""
+    return (near * far) / (far - normalized_depth * (far - near))
+
+
+def depth_clip_factor(
     current_depth: np.ndarray,
     history_depth: np.ndarray,
     prev_uv: np.ndarray,
-    depth_threshold: float = 0.02,
+    near: float,
+    far: float,
+    fov_y_radians: float,
 ) -> np.ndarray:
     """
-    Determine which reprojected history samples are trustworthy.
+    Ported from AMD FSR2's ComputeDepthClip (ffx_fsr2_depth_clip.h).
 
-    A sample is INVALID (disoccluded) if:
-      - prev_uv falls outside [0, 1] (reprojects off-screen), OR
-      - the depth at the reprojected location in the previous frame
-        differs from the current depth by more than depth_threshold
-        (relative difference) -- this indicates the surface visible
-        now was occluded/absent in the previous frame.
+    IMPORTANT -- semantics match AMD's naming exactly, which is
+    counter-intuitive on first read: this returns a REJECT signal, not a
+    trust/confidence signal. 1.0 = disoccluded, reject history. 0.0 = no
+    depth discontinuity detected, history is fine. Downstream (accumulate
+    pass) uses it as `accumulation *= (1.0 - depth_clip_factor)`.
 
-    current_depth: (H, W) array, normalized depth [0, 1] (0 = near)
-    history_depth: (H, W) array, previous frame's depth buffer
-    prev_uv: (H, W, 2) array from reproject_uv()
-    returns: (H, W) boolean array, True = valid (usable) history
+    Deliberately named and structured to match the source 1:1 (per-tap term,
+    then combined) rather than re-derived, because re-deriving this from
+    "what should high/low mean" produced an inverted-sign bug during initial
+    implementation. Match the source's data flow, not your own intuition
+    about what the output "should" mean.
+
+    current_depth, history_depth: (H, W) normalized depth [0,1], 0=near
+    prev_uv: (H, W, 2) from reproject_uv()
+    near, far: camera near/far planes (same units)
+    fov_y_radians: vertical field of view
+
+    returns: (H, W) float array in [0, 1]. 1.0 = reject, 0.0 = trust.
     """
     in_bounds = (
         (prev_uv[..., 0] >= 0.0)
@@ -98,33 +115,81 @@ def disocclusion_validity(
         & (prev_uv[..., 1] <= 1.0)
     )
 
-    sampled_history_depth = sample_bilinear(history_depth, prev_uv)
+    current_view_depth = normalized_to_view_space_depth(current_depth, near, far)
+    sampled_history_normalized = sample_bilinear(history_depth, prev_uv)
+    history_view_depth = normalized_to_view_space_depth(
+        sampled_history_normalized, near, far
+    )
 
-    # Relative depth difference test. Avoid div-by-zero on near-zero depth.
-    denom = np.maximum(current_depth, 1e-5)
-    relative_diff = np.abs(current_depth - sampled_history_depth) / denom
+    # depth_diff > 0: current surface is FARTHER than history at this
+    # location -- a nearer occluder from last frame is gone/moved, and a
+    # farther surface (which history never saw here) is now visible.
+    # That's the case this term detects and penalizes.
+    depth_diff = current_view_depth - history_view_depth
 
-    depth_ok = relative_diff <= depth_threshold
+    half_fov = fov_y_radians / 2.0
+    kfov = np.sqrt(1.0 + np.tan(half_fov) ** 2)
 
-    return in_bounds & depth_ok
+    h, w = current_depth.shape
+    half_viewport_width = np.hypot(w, h)
+
+    depth_threshold_view = np.maximum(current_view_depth, history_view_depth)
+    required_separation = (
+        FSR2_KSEP * kfov * half_viewport_width * depth_threshold_view
+    )
+
+    resolution_factor = np.clip(np.hypot(w, h) / np.hypot(1920.0, 1080.0), 0.0, 1.0)
+    power = 1.0 + resolution_factor * 2.0  # lerp(1.0, 3.0, resolution_factor)
+
+    # Per-tap term from AMD source: pow(saturate(required/actual), power).
+    # actual_gap >> required  -> term -> 0
+    # actual_gap <= required  -> term -> 1
+    term = np.where(
+        depth_diff > 0.0,
+        np.power(
+            np.clip(required_separation / np.maximum(depth_diff, 1e-8), 0.0, 1.0),
+            power,
+        ),
+        1.0,  # depth_diff <= 0: AMD skips this tap (weightSum stays 0 -> D=0
+              # for single-tap case). Encode as term=1.0 here so that the
+              # D = 1 - term step below correctly yields D=0.
+    )
+
+    # single-sample equivalent of AMD's `saturate(1 - fDepth/weightSum)`
+    reject_signal = np.clip(1.0 - term, 0.0, 1.0)
+
+    # off-screen reprojection: no history sample exists at all -> full reject
+    return np.where(in_bounds, reject_signal, 1.0)
 
 
 def prepare_pass(
     current_depth: np.ndarray,
     history_depth: np.ndarray,
     motion_vectors: np.ndarray,
-    depth_threshold: float = 0.02,
+    near: float = 0.1,
+    far: float = 1000.0,
+    fov_y_radians: float = np.radians(60.0),
 ):
     """
     Full prepare pass.
 
+    near/far/fov_y_radians default to reasonable game camera values but
+    should be passed explicitly from the actual camera in real use --
+    the disocclusion threshold is directly sensitive to these.
+
     Returns:
         prev_uv: (H, W, 2) reprojected UVs into previous frame
-        validity: (H, W) bool mask, True where history can be trusted
+        trust: (H, W) float array in [0,1]. 1.0 = fully trusted history,
+               0.0 = fully rejected/disoccluded. (Inverted from the raw
+               depth_clip_factor -- this outer function hands callers the
+               intuitive "how much do I trust this" value; depth_clip_factor
+               itself keeps AMD's original reject-signal convention so it's
+               directly comparable against the source during the shader port.)
     """
     h, w = current_depth.shape
     prev_uv = reproject_uv(motion_vectors, h, w)
-    validity = disocclusion_validity(
-        current_depth, history_depth, prev_uv, depth_threshold
+    reject = depth_clip_factor(
+        current_depth, history_depth, prev_uv, near, far, fov_y_radians
     )
-    return prev_uv, validity
+    trust = 1.0 - reject
+    return prev_uv, trust
