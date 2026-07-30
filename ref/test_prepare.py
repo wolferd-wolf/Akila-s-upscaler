@@ -94,24 +94,31 @@ def test_depth_clip_factor_static_scene_not_rejected():
     # depth_clip_factor: 1.0 = reject, 0.0 = trust (matches AMD naming).
     h, w = 8, 8
     depth = np.full((h, w), 0.5)
-    mv = np.zeros((h, w, 2))
-    prev_uv = reproject_uv(mv, h, w)
     reject = depth_clip_factor(
-        depth, depth, prev_uv, near=0.1, far=1000.0, fov_y_radians=FOV_60
+        px_lr_pos=(4, 4), current_depth=depth, history_depth=depth,
+        reprojected_uv=(0.5625, 0.5625),  # (4+0.5)/8, on-screen, zero motion
+        render_size=(w, h), near=0.1, far=1000.0, fov_y_radians=FOV_60,
     )
-    assert np.all(reject < 0.01)
+    assert reject < 0.01
 
 
-def test_depth_clip_factor_rejects_off_screen_reprojection():
+def test_depth_clip_factor_fully_off_screen_reprojection_falls_back_to_trust():
+    # CORRECTED expectation, found while reading AMD's actual caller code:
+    # the real ComputeDepthClip has NO explicit off-screen override --
+    # a fully off-screen reprojection means every tap fails the on-screen
+    # check, weight_sum stays 0, and the function's own fallback
+    # (weightSum>0 ? ... : 0.0) returns 0.0 = TRUST. This looks backwards
+    # on first read, but off-screen rejection is actually handled
+    # elsewhere in the real pipeline (reproject.py's is_existing_sample
+    # check, on a different UV at a different stage) -- not here.
     h, w = 8, 8
     depth = np.full((h, w), 0.5)
-    mv = np.zeros((h, w, 2))
-    mv[..., 0] = -2.0
-    prev_uv = reproject_uv(mv, h, w)
     reject = depth_clip_factor(
-        depth, depth, prev_uv, near=0.1, far=1000.0, fov_y_radians=FOV_60
+        px_lr_pos=(4, 4), current_depth=depth, history_depth=depth,
+        reprojected_uv=(3.0, 3.0),  # far outside [0,1] -- all 4 taps off-screen
+        render_size=(w, h), near=0.1, far=1000.0, fov_y_radians=FOV_60,
     )
-    assert np.all(reject == 1.0)
+    assert reject == 0.0
 
 
 def test_depth_clip_factor_large_depth_jump_rejected():
@@ -122,26 +129,24 @@ def test_depth_clip_factor_large_depth_jump_rejected():
     h, w = 8, 8
     current_depth = np.full((h, w), 0.95)  # far now
     history_depth = np.full((h, w), 0.05)  # was near
-    mv = np.zeros((h, w, 2))
-    prev_uv = reproject_uv(mv, h, w)
     reject = depth_clip_factor(
-        current_depth, history_depth, prev_uv,
+        px_lr_pos=(4, 4), current_depth=current_depth, history_depth=history_depth,
+        reprojected_uv=(0.5625, 0.5625), render_size=(w, h),
         near=0.1, far=1000.0, fov_y_radians=FOV_60,
     )
-    assert np.all(reject > 0.5)
+    assert reject > 0.5
 
 
 def test_depth_clip_factor_tiny_depth_noise_not_rejected():
     h, w = 8, 8
     current_depth = np.full((h, w), 0.5)
     history_depth = current_depth + 1e-6
-    mv = np.zeros((h, w, 2))
-    prev_uv = reproject_uv(mv, h, w)
     reject = depth_clip_factor(
-        current_depth, history_depth, prev_uv,
+        px_lr_pos=(4, 4), current_depth=current_depth, history_depth=history_depth,
+        reprojected_uv=(0.5625, 0.5625), render_size=(w, h),
         near=0.1, far=1000.0, fov_y_radians=FOV_60,
     )
-    assert np.all(reject < 0.1)
+    assert reject < 0.1
 
 
 def test_depth_clip_factor_new_closer_geometry_not_penalized_by_this_term():
@@ -153,13 +158,33 @@ def test_depth_clip_factor_new_closer_geometry_not_penalized_by_this_term():
     h, w = 8, 8
     current_depth = np.full((h, w), 0.1)  # near now
     history_depth = np.full((h, w), 0.9)  # was far
-    mv = np.zeros((h, w, 2))
-    prev_uv = reproject_uv(mv, h, w)
     reject = depth_clip_factor(
-        current_depth, history_depth, prev_uv,
+        px_lr_pos=(4, 4), current_depth=current_depth, history_depth=history_depth,
+        reprojected_uv=(0.5625, 0.5625), render_size=(w, h),
         near=0.1, far=1000.0, fov_y_radians=FOV_60,
     )
-    assert np.all(reject < 0.01)
+    assert reject < 0.01
+
+
+def test_depth_clip_factor_edge_between_taps_detected_where_interpolation_would_hide_it():
+    # This is the exact scenario the earlier (incorrect) version of this
+    # function got wrong: a genuine depth discontinuity sitting between
+    # two of the 4 bilinear taps. Interpolating depth first would blend
+    # right across it and see no edge at all. Evaluating each tap's term
+    # separately (the real algorithm) should still catch it.
+    h, w = 8, 8
+    current_depth = np.full((h, w), 0.9)  # far surface just revealed
+    history_depth = np.full((h, w), 0.9)
+    # put a small pocket of "near" history right where 2 of the 4 taps
+    # for reprojected_uv=(0.5,0.5) will land (base texel + right neighbor)
+    history_depth[3, 3] = 0.05
+    history_depth[3, 4] = 0.05
+    reject = depth_clip_factor(
+        px_lr_pos=(4, 3), current_depth=current_depth, history_depth=history_depth,
+        reprojected_uv=(0.5, 0.4375), render_size=(w, h),  # (3+0.5)/8 for v
+        near=0.1, far=1000.0, fov_y_radians=FOV_60,
+    )
+    assert reject > 0.3  # meaningfully rejected, not washed out by averaging
 
 
 def test_ksep_constant_matches_fsr2_source():

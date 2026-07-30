@@ -25,7 +25,7 @@ on every call.
 
 import numpy as np
 
-from prepare import reproject_uv, depth_clip_factor as compute_depth_clip_factor
+from prepare import depth_clip_factor as compute_depth_clip_factor
 from upsample import compute_upsampled_color_and_weight
 from accumulate import accumulate as blend_accumulate, rectify_history
 from lock_status import update_lock_status, initialize_new_lock_sample
@@ -82,17 +82,21 @@ def accumulate_pixel(
 
     lr_uv = (hr_uv[0], hr_uv[1])
 
-    depth_clip = compute_depth_clip_factor(
-        current_depth=current_depth,
-        history_depth=history_depth,
-        prev_uv=reproject_uv(
-            np.zeros((h_lr, w_lr, 2)) + np.array(motion_vector), h_lr, w_lr
-        ),
-        near=near, far=far, fov_y_radians=fov_y_radians,
-    )
     lr_x = int(np.clip(lr_uv[0] * w_lr, 0, w_lr - 1))
     lr_y = int(np.clip(lr_uv[1] * h_lr, 0, h_lr - 1))
-    this_pixel_depth_clip = float(depth_clip[lr_y, lr_x])
+    lr_uv_for_pixel = ((lr_x + 0.5) / w_lr, (lr_y + 0.5) / h_lr)
+    reprojected_lr_uv = (
+        lr_uv_for_pixel[0] - motion_vector[0],
+        lr_uv_for_pixel[1] - motion_vector[1],
+    )
+    this_pixel_depth_clip = compute_depth_clip_factor(
+        px_lr_pos=(lr_x, lr_y),
+        current_depth=current_depth,
+        history_depth=history_depth,
+        reprojected_uv=reprojected_lr_uv,
+        render_size=(w_lr, h_lr),
+        near=near, far=far, fov_y_radians=fov_y_radians,
+    )
 
     is_reset_frame = frame_index == 0
     is_new_sample = (not is_existing_sample) or is_reset_frame
