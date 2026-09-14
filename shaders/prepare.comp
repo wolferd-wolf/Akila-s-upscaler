@@ -1,0 +1,138 @@
+#version 450
+
+// Prepare pass -- depth-clip / disocclusion detection.
+//
+// 1:1 GLSL port of ref/prepare.py's reproject_uv() and
+// depth_clip_factor(), which is itself a verified port of AMD FSR2's
+// ComputeDepthClip (ffx_fsr2_depth_clip.h). See prepare.py's docstring
+// for the full history of what was corrected and why -- this shader
+// follows that corrected (per-tap-then-average) version, NOT the
+// original (interpolate-then-test) one.
+//
+// Deliberately NOT using any subgroup/wave intrinsics -- see the
+// project's mobile feasibility notes. Workgroup size is small and
+// generic (8x8 = 64 invocations), not tied to any particular GPU's
+// native execution width.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D currentDepth;   // R32F, normalized [0,1], 0=near
+layout(set = 0, binding = 1) uniform sampler2D historyDepth;   // R32F, reconstructed prev depth,
+                                                                 // +inf where nothing scattered there
+layout(set = 0, binding = 2) uniform sampler2D motionVectors;  // RG32F, UV-space
+
+layout(set = 0, binding = 3, r32f) uniform writeonly image2D outTrust; // 1.0=trust, 0.0=reject
+
+layout(push_constant) uniform PushConstants {
+    ivec2 renderSize;
+    float near;
+    float far;
+    float fovYRadians;
+} pc;
+
+const float FSR2_KSEP = 1.37e-05;
+const float RECONSTRUCTED_DEPTH_BILINEAR_WEIGHT_THRESHOLD = 0.01;
+
+float normalizedToViewSpaceDepth(float normalizedDepth, float nearP, float farP) {
+    return (nearP * farP) / (farP - normalizedDepth * (farP - nearP));
+}
+
+// Matches ref/reconstruct_depth.py's bilinear_scatter_weights, ported
+// here directly rather than imported (GLSL has no module system;
+// duplicated once, not copy-pasted repeatedly across shaders -- shared
+// via this comment as the canonical reference point for future shaders
+// that need the same tap layout).
+void bilinearTaps(vec2 uv, ivec2 renderSize, out ivec2 basePos, out ivec2 offsets[4], out float weights[4]) {
+    vec2 texelPos = uv * vec2(renderSize) - 0.5;
+    basePos = ivec2(floor(texelPos));
+    vec2 frac = texelPos - vec2(basePos);
+
+    offsets[0] = ivec2(0, 0); weights[0] = (1.0 - frac.x) * (1.0 - frac.y);
+    offsets[1] = ivec2(1, 0); weights[1] = frac.x * (1.0 - frac.y);
+    offsets[2] = ivec2(0, 1); weights[2] = (1.0 - frac.x) * frac.y;
+    offsets[3] = ivec2(1, 1); weights[3] = frac.x * frac.y;
+}
+
+// Ported from prepare.py's depth_clip_factor(). Returns REJECT signal:
+// 1.0 = disoccluded, reject history. 0.0 = trust. See prepare.py's
+// docstring for why this is a reject signal, not a trust signal --
+// this GLSL port keeps AMD's original naming/semantics for the same
+// reason: re-deriving from "what should high/low mean" is exactly how
+// the earlier sign-inversion bug happened during the Python port.
+float depthClipFactor(ivec2 pxLrPos, vec2 reprojectedUv) {
+    float currentDepthSample = texelFetch(currentDepth, pxLrPos, 0).r;
+    float currentViewDepth = normalizedToViewSpaceDepth(currentDepthSample, pc.near, pc.far);
+
+    ivec2 basePos;
+    ivec2 offsets[4];
+    float weights[4];
+    bilinearTaps(reprojectedUv, pc.renderSize, basePos, offsets, weights);
+
+    float halfFov = pc.fovYRadians * 0.5;
+    float kfov = sqrt(1.0 + tan(halfFov) * tan(halfFov));
+    float halfViewportWidth = length(vec2(pc.renderSize));
+    float resolutionFactor = clamp(
+        length(vec2(pc.renderSize)) / length(vec2(1920.0, 1080.0)), 0.0, 1.0
+    );
+    float power = 1.0 + resolutionFactor * 2.0; // lerp(1.0, 3.0, resolutionFactor)
+
+    float accumulatedTerm = 0.0;
+    float weightSum = 0.0;
+
+    for (int i = 0; i < 4; ++i) {
+        ivec2 samplePos = basePos + offsets[i];
+        float weight = weights[i];
+
+        if (samplePos.x < 0 || samplePos.x >= pc.renderSize.x ||
+            samplePos.y < 0 || samplePos.y >= pc.renderSize.y) {
+            continue;
+        }
+        if (weight <= RECONSTRUCTED_DEPTH_BILINEAR_WEIGHT_THRESHOLD) {
+            continue;
+        }
+
+        float prevDepthSample = texelFetch(historyDepth, samplePos, 0).r;
+        if (isinf(prevDepthSample)) {
+            continue; // texel never received a scattered depth
+        }
+        float prevViewDepth = normalizedToViewSpaceDepth(prevDepthSample, pc.near, pc.far);
+
+        float depthDiff = currentViewDepth - prevViewDepth;
+        if (depthDiff <= 0.0) {
+            continue; // AMD: tap contributes nothing here (not even weight)
+        }
+
+        float depthThresholdView = max(currentViewDepth, prevViewDepth);
+        float requiredSeparation = FSR2_KSEP * kfov * halfViewportWidth * depthThresholdView;
+
+        float term = pow(clamp(requiredSeparation / max(depthDiff, 1e-8), 0.0, 1.0), power);
+        accumulatedTerm += term * weight;
+        weightSum += weight;
+    }
+
+    if (weightSum > 0.0) {
+        return clamp(1.0 - accumulatedTerm / weightSum, 0.0, 1.0);
+    }
+    return 0.0; // NOTE: no explicit off-screen override -- matches AMD
+                // exactly. Off-screen rejection is handled elsewhere in
+                // the pipeline (the Reproject stage's is_existing_sample
+                // check), not here. See prepare.py's docstring for the
+                // full reasoning -- this was a real correction, not
+                // arbitrary.
+}
+
+void main() {
+    ivec2 pxPos = ivec2(gl_GlobalInvocationID.xy);
+    if (pxPos.x >= pc.renderSize.x || pxPos.y >= pc.renderSize.y) {
+        return; // out-of-bounds invocations at the edge of the dispatch grid
+    }
+
+    vec2 uv = (vec2(pxPos) + 0.5) / vec2(pc.renderSize);
+    vec2 mv = texelFetch(motionVectors, pxPos, 0).rg;
+    vec2 prevUv = uv - mv; // matches prepare.py's reproject_uv sign convention
+
+    float reject = depthClipFactor(pxPos, prevUv);
+    float trust = 1.0 - reject;
+
+    imageStore(outTrust, pxPos, vec4(trust, 0.0, 0.0, 0.0));
+}

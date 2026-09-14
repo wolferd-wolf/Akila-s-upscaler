@@ -1,0 +1,28 @@
+name: Validate shaders
+
+on:
+  push:
+    paths:
+      - 'shaders/**'
+  pull_request:
+    paths:
+      - 'shaders/**'
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install glslang-tools
+        run: sudo apt-get update -qq && sudo apt-get install -y glslang-tools
+
+      - name: Compile all compute shaders
+        run: |
+          cd shaders
+          fail=0
+          for f in *.comp; do
+            echo "Compiling $f..."
+            glslangValidator -V --target-env vulkan1.1 "$f" -o "${f%.comp}.spv" || fail=1
+          done
+          exit $fail
